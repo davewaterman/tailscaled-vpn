@@ -1,0 +1,288 @@
+#!/bin/bash
+# vpn on|off|status: route this Mac's internet traffic through a Tailscale
+# exit node. The exit node's address comes from .env (see .env.example).
+#
+# Open-source tailscaled on macOS gets two things wrong with an exit node:
+#  - IPv4: it runs "route add 0.0.0.0/0", which fails because the network already has
+#    a default route, so traffic is NOT tunneled; turning the exit node off then
+#    deletes the network's default route. We add 0/1 + 128/1 (and the IPv6 halves),
+#    which outrank the default, and put the default back on "off".
+#  - DNS: it can't replace the main DNS server, so lookups go to the local
+#    network's. We point every network service at Tailscale's 100.100.100.100.
+# "on" and "off" need sudo for the routes. Must run under macOS's bash 3.2.
+set -uo pipefail
+
+TS_DNS=100.100.100.100
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/tailscaled-vpn"
+TAB=$'\t'
+# family, destination, an address inside it (used to see where it's routed)
+HALVES="inet 0.0.0.0/1 1.1.1.1
+inet 128.0.0.0/1 208.67.222.222
+inet6 ::/1 2606:4700:4700::1111
+inet6 8000::/1 8000::1"
+
+# Follow symlinks, so this works when linked into a directory on PATH.
+self=$0
+while [[ -L $self ]]; do
+  link=$(readlink "$self")
+  [[ $link == /* ]] || link="$(dirname "$self")/$link"
+  self=$link
+done
+ENV_FILE="$(cd "$(dirname "$self")" && pwd)/.env"
+
+# Read one NAME=value from .env without executing the file. The environment wins.
+setting() {
+  local v=${!1:-}
+  [[ -z $v && -f $ENV_FILE ]] && v=$(awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); sub(/[[:space:]]+$/, ""); print; exit}' "$ENV_FILE")
+  echo "$v"
+}
+EXIT_NODE_IP=$(setting EXIT_NODE_IP)
+TS=$(setting TAILSCALE_BIN); TS=${TS:-$(command -v tailscale || echo /opt/homebrew/bin/tailscale)}
+
+say() { echo "vpn: $*" >&2; }
+die() { say "$*"; exit 1; }
+limit() { perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; }   # macOS has no timeout(1)
+ts_json() { limit 10 "$TS" status --json 2>/dev/null; }
+peer() { jq -r --arg ip "$EXIT_NODE_IP" "[.Peer[]? | select((.TailscaleIPs // []) | index(\$ip))][0] | $1"; }
+set_exit_node() { limit 20 "$TS" set "$@" 2>&1 | awk '!/^Warning: client version/' >&2; }
+public_ip() {
+  local ip
+  ip=$(curl -q -fsS4 --noproxy '*' --max-time 10 https://api.ipify.org 2>/dev/null) || return 1
+  [[ $ip =~ ^[0-9]+(\.[0-9]+){3}$ ]] && echo "$ip"
+}
+# Replace a state file in one step, so an interruption can't leave half of it.
+save() { mkdir -p "$STATE" && cat > "$STATE/$1.new" && mv -f "$STATE/$1.new" "$STATE/$1"; }
+saved() { cat "$STATE/$1" 2>/dev/null; return 0; }
+
+# --- Routes -----------------------------------------------------------------
+
+via() { route -n get "$@" 2>/dev/null | awk '/interface:/{print $2}'; }
+tun() { local t; t=$(via "$TS_DNS"); [[ $t == utun* ]] && echo "$t"; }
+# The main (unscoped, non-tunnel) default route, as "gateway interface".
+default_of() {
+  netstat -rnf "$1" | awk '$1=="default" && $2 !~ /^link#/ && $2 ~ /[.:]/ && $4 !~ /^utun/ && $3 !~ /I/ {print $2, $4; exit}'
+}
+# True only if this call created the route (so it's ours to delete later).
+route_add() {
+  local out
+  out=$(sudo -n route -n add "$@" 2>&1) || return 1
+  [[ $out != *"File exists"* ]]
+}
+route_del() { sudo -n route -n delete "$@" >/dev/null 2>&1; }
+
+routed() {
+  local t fam net probe
+  t=$(tun) || return 1
+  while read -r fam net probe; do
+    [[ $(via "-$fam" "$probe") == "$t" ]] || return 1
+  done <<<"$HALVES"
+}
+
+save_defaults() {
+  local fam d out=""
+  for fam in inet inet6; do
+    d=$(default_of $fam)
+    # No live default: keep what an earlier run recorded.
+    [[ -n $d ]] || d=$(saved defaults | awk -v f=$fam '$1==f{print $2, $3}')
+    [[ -n $d ]] && out+="$fam $d"$'\n'
+  done
+  printf '%s' "$out" | save defaults
+}
+
+# Tailscale binds its own sockets to the network interface. Those need a default
+# scoped to it, or the halves would loop Tailscale's packets into the tunnel.
+routes_on() {
+  local t fam net probe gw dev
+  t=$(tun) || return 1
+  # Each route is recorded before the next is added. Re-adding one we already
+  # own fails with "File exists", so the earlier record stays.
+  for fam in inet inet6; do
+    read -r gw dev <<<"$(default_of $fam)"
+    [[ -n $gw ]] || continue
+    route_add -ifscope "$dev" -$fam default "$gw" || continue
+    { saved scoped; echo "$fam $gw $dev"; } | save scoped || return 1
+  done
+  while read -r fam net probe <&3; do
+    route_add -$fam "$net" -iface "$t" || continue
+    { saved halves; echo "$fam $net $probe $t"; } | save halves || return 1
+  done 3<<<"$HALVES"
+  routed
+}
+
+# Deletes only routes recorded as ours and, for the halves, still on our tunnel:
+# another VPN may own the same destinations by now.
+routes_off() {
+  local fam gw dev net probe t
+  while read -r fam net probe t <&3; do
+    [[ -n $t && $(via "-$fam" "$probe") == "$t" && $(tun) == "$t" ]] && route_del -$fam "$net" -iface "$t"
+  done 3<<<"$(saved halves)"
+  while read -r fam gw dev <&3; do
+    [[ -n $dev ]] && route_del -ifscope "$dev" -$fam default "$gw"
+  done 3<<<"$(saved scoped)"
+  rm -f "$STATE/halves" "$STATE/scoped"
+}
+
+# Put back defaults that tailscaled deleted. Returns 1 if IPv4 should have one
+# and doesn't.
+restore_defaults() {
+  local fam gw dev r
+  while read -r fam gw dev <&3; do
+    [[ -n $dev && -z $(default_of $fam) ]] || continue
+    if [[ $fam == inet ]]; then
+      r=$(ipconfig getoption "$dev" router 2>/dev/null)   # current DHCP router, if any
+      gw=${r:-$gw}
+    fi
+    # Only a gateway directly reachable on its interface: we may have moved.
+    [[ $(via "-$fam" "$gw") == "$dev" ]] && sudo -n route -n add -$fam default "$gw" >/dev/null 2>&1
+  done 3<<<"$(saved defaults)"
+  [[ -n $(default_of inet) ]] && return 0
+  ! saved defaults | awk '$1=="inet"{f=1} END{exit !f}'
+}
+
+# --- DNS --------------------------------------------------------------------
+
+# First line is a header; a leading * marks a disabled service.
+services() { networksetup -listallnetworkservices | awk 'NR>1 && !/^\*/'; }
+all_services() { networksetup -listallnetworkservices | awk 'NR>1 {sub(/^\*/, ""); print}'; }
+# Prints a space-separated list, nothing if automatic; fails if unreadable.
+get_dns() {
+  local out
+  out=$(networksetup -getdnsservers "$1" 2>/dev/null) || return 1
+  case $out in
+    "There aren't any DNS Servers"*) ;;
+    *[Ee]rror*|"") return 1 ;;
+    *) echo "$out" | xargs ;;
+  esac
+}
+# networksetup can fail with exit code 0, so check the result. $2 is unquoted on
+# purpose: it is a space-separated list.
+set_dns() {
+  networksetup -setdnsservers "$1" ${2:-Empty} >/dev/null 2>&1
+  local now; now=$(get_dns "$1") && [[ $now == "$2" ]]
+}
+saved_dns() { saved dns | awk -F"$TAB" -v s="$1" '$1==s{print $2; exit}'; }
+
+dns_on() {
+  local s cur out="" old
+  # Refresh each service's record unless it's already ours; keep other records.
+  while IFS= read -r s; do
+    cur=$(get_dns "$s") || { say "can't read DNS for $s"; return 1; }
+    [[ $cur == "$TS_DNS" ]] && cur=$(saved_dns "$s")
+    out+="$s$TAB$cur"$'\n'
+  done < <(services)
+  [[ -n $out ]] || return 1
+  old=$(saved dns | awk -F"$TAB" 'NR==FNR{seen[$1]=1; next} !($1 in seen)' <(printf '%s' "$out") -)
+  printf '%s%s\n' "$out" "$old" | awk 'NF' | save dns || { say "can't save DNS settings in $STATE"; return 1; }
+  while IFS= read -r s; do set_dns "$s" "$TS_DNS" || return 1; done < <(services)
+}
+
+dns_off() {
+  local s cur rc=0 handled=""
+  while IFS= read -r s; do
+    if ! cur=$(get_dns "$s"); then say "can't read DNS for $s"; rc=1; continue; fi
+    if [[ $cur == "$TS_DNS" ]]; then
+      set_dns "$s" "$(saved_dns "$s")" || { say "can't restore DNS for $s"; rc=1; continue; }
+    fi
+    handled+="$s"$'\n'
+  done < <(all_services)
+  # Forget what was restored; keep failures and services of other Locations.
+  if [[ -f $STATE/dns ]]; then
+    saved dns | awk -F"$TAB" 'NR==FNR{d[$0]=1; next} !($1 in d)' <(printf '%s\n' "$handled") - | save dns || rc=1
+  fi
+  return $rc
+}
+
+# Names of enabled services whose DNS is (or isn't) Tailscale's.
+services_with() {  # services_with ours|other
+  local s cur kind
+  while IFS= read -r s; do
+    cur=$(get_dns "$s")
+    kind=other; [[ $cur == "$TS_DNS" ]] && kind=ours
+    [[ $kind == "$1" ]] && printf '[%s] ' "$s"
+  done < <(services)
+  return 0
+}
+
+# --- Commands ---------------------------------------------------------------
+
+off() {
+  local rc=0 i
+  sudo -v || { say "need sudo; nothing changed"; return 1; }
+  # Stopping halfway would leave no default route or no DNS.
+  trap '' INT TERM HUP
+  save_defaults || rc=1
+  routes_off
+  dns_off || rc=1
+  set_exit_node --exit-node= || { say "couldn't turn off the exit node in Tailscale"; rc=1; }
+  for i in 1 2 3; do                 # tailscaled may apply it a moment later
+    sleep 1
+    restore_defaults
+  done
+  restore_defaults || { say "no default route; reconnect your network (Wi-Fi off and on, or replug the cable)"; rc=1; }
+  [[ $rc == 0 ]] && rm -f "$STATE/defaults"
+  return $rc
+}
+
+# Undo a failed "on", unless the VPN was already on: dropping it would expose
+# traffic because of, say, one failed internet check.
+already=
+abort_on() {
+  [[ -z $already ]] || die "$1; VPN left on, but it may not be fully protecting. Check vpn status, or run vpn off"
+  trap '' INT TERM HUP
+  say "$1; undoing"
+  off || die "undo was incomplete: run vpn off, or reconnect your network. Traffic is NOT protected"
+  die "VPN is OFF, traffic is NOT protected"
+}
+
+on() {
+  local j i
+  j=$(ts_json) || die "Tailscale isn't responding; VPN not changed"
+  [[ $(peer .Online <<<"$j") == true ]] || die "the exit node is offline or not in your tailnet; VPN not changed"
+  [[ $(peer .ExitNodeOption <<<"$j") == true ]] || die "the exit node isn't approved: https://console.tailscale.com/admin/machines"
+  [[ $(peer .ExitNode <<<"$j") == true ]] && already=1
+  sudo -v || die "need sudo; VPN not changed"
+  save_defaults || die "can't write to $STATE; VPN not changed"
+  trap 'abort_on interrupted' INT TERM HUP
+  set_exit_node --exit-node="$EXIT_NODE_IP" --exit-node-allow-lan-access=false || abort_on "couldn't set the exit node"
+  routes_on || abort_on "traffic isn't routed into the tunnel"
+  dns_on || abort_on "couldn't set DNS"
+  for i in 1 2 3; do public_ip >/dev/null && break; sleep 2; done
+  status || abort_on "the VPN isn't fully working"
+}
+
+# Exit code: 0 protecting and the internet works, 3 off, 1 anything else.
+status() {
+  local j ip rc=1 left other
+  left=$(services_with ours)
+  if ! j=$(ts_json) || [[ $(jq -r .BackendState <<<"$j") != Running ]]; then
+    echo "VPN: NOT PROTECTING, Tailscale isn't running"
+    [[ -n $left ]] && echo "VPN DNS settings remain on: $left(run: vpn off)"
+  elif [[ -z $(jq -r '.ExitNodeStatus.ID // empty' <<<"$j") ]]; then
+    echo "VPN: off"; rc=3
+    if [[ -n $left || -s $STATE/halves ]]; then echo "VPN settings remain (run: vpn off)"; rc=1; fi
+  elif [[ $(peer .ExitNode <<<"$j") != true ]]; then echo "VPN: a different exit node is in use"
+  elif [[ $(peer .Online <<<"$j") != true ]]; then echo "VPN: on, but the exit node is OFFLINE"
+  elif ! routed; then echo "VPN: NOT PROTECTING, traffic is outside the tunnel (run: vpn on)"
+  else
+    other=$(services_with other)
+    if [[ -n $other ]]; then echo "VPN: on, but DNS is outside the tunnel on: $other(run: vpn on)"
+    else echo "VPN: on via $(peer .HostName <<<"$j")"; rc=0; fi
+  fi
+  if ip=$(public_ip); then echo "Public IP: $ip"; else echo "Public IP: unreachable"; [[ $rc == 0 ]] && rc=1; fi
+  return $rc
+}
+
+# Not needed by "off", which must work even if these are missing.
+check_setup() {
+  [[ -x $TS ]] || die "no tailscale at $TS"
+  command -v jq >/dev/null || die "jq is required (brew install jq)"
+  [[ $EXIT_NODE_IP =~ ^100(\.[0-9]{1,3}){3}$ ]] || die "set EXIT_NODE_IP in $ENV_FILE to the exit node's Tailscale IPv4 address (see .env.example)"
+}
+
+[[ $EUID != 0 ]] || die "run without sudo; it asks for your password when needed"
+case "${1:-status}" in
+  on) check_setup; on ;;
+  off) off || die "could not fully turn off"; echo "VPN: off" ;;
+  status) check_setup; status ;;
+  *) die "usage: vpn on|off|status" ;;
+esac
