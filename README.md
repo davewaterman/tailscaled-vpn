@@ -95,7 +95,7 @@ interrupts your connection.
 A green filled shield means on, a grey open lock means off, and a red warning
 shield means something needs attention. It refreshes every 10 seconds using
 `vpn status --local`, so green doesn't prove the internet is reachable. Click it
-for **Turn on** and **Turn off**, which open a terminal for your password. You
+for **Turn Tailscale VPN on** and **Turn Tailscale VPN off**, which open a terminal for your password. You
 can close that window once the command finishes; closing it during `on` interrupts it.
 
 ## Limits
