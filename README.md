@@ -73,8 +73,30 @@ it warns and leaves it on.
 api.ipify.org to check your public IP. To run `vpn` from anywhere,
 symlink it into a directory on your `PATH`.
 
+`status --local` skips the public IP check and contacts nothing.
+
 `./test-vpn.sh` turns the VPN on, checks it and turns it off again. It briefly
 interrupts your connection.
+
+## Menu bar indicator (optional)
+
+1. Install [SwiftBar](https://github.com/swiftbar/SwiftBar):
+   `brew install --cask swiftbar`.
+2. Open it and choose any folder for your plugins, such as `~/SwiftBar`. SwiftBar
+   uses one plugin folder, so don't choose this project's.
+3. From this project's folder, link the plugin into it:
+
+   ```bash
+   ln -s "$PWD/swiftbar/vpn.10s.sh" ~/SwiftBar/
+   ```
+
+   If you move or rename this project, replace the link.
+
+A green filled shield means on, a grey open lock means off, and a red warning
+shield means something needs attention. It refreshes every 10 seconds using
+`vpn status --local`, so green doesn't prove the internet is reachable. Click it
+for **Turn on** and **Turn off**, which open a terminal for your password. You
+can close that window once the command finishes; closing it during `on` interrupts it.
 
 ## Limits
 
@@ -83,9 +105,12 @@ interrupts your connection.
   first and `vpn on` after. Network changes, sleep and reboot while on are untested; check `vpn status` afterwards.
 - **Lost internet:** run `vpn off`. If that doesn't help, reconnect your
   network (turn Wi-Fi off and on, or unplug and replug the cable).
-- **Hostile networks:** whatever the network declares local is reached directly,
-  so a malicious router could claim public addresses (the TunnelVision and
-  TunnelCrack attacks) and `status` would not notice.
+- **Hostile networks:** a malicious network can route public addresses around the
+  VPN (the TunnelVision and TunnelCrack attacks). `on` refuses to start on such a
+  network, and `status` warns if it happens later, but nothing blocks the traffic
+  meanwhile. Not detected: an IPv6 `/64` claimed as local, because normal networks
+  do that too, and forged neighbor entries. Networks that use public addresses
+  internally, as some universities do, are refused too.
 - **Open connections:** apps already connected, or bound to a specific network
   interface, may bypass the tunnel. Restart sensitive apps after `vpn on`.
 - **Previous settings:** `vpn off` doesn't restore a different exit node or the

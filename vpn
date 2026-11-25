@@ -1,5 +1,5 @@
 #!/bin/bash
-# vpn on|off|status: route this Mac's internet traffic through a Tailscale
+# vpn on|off|status [--local]: route this Mac's internet traffic through a Tailscale
 # exit node. The exit node's address comes from .env (see .env.example).
 #
 # Open-source tailscaled on macOS gets two things wrong with an exit node:
@@ -76,6 +76,32 @@ routed() {
   while read -r fam net probe; do
     [[ $(via "-$fam" "$probe") == "$t" ]] || return 1
   done <<<"$HALVES"
+}
+
+# Routes to public addresses that avoid the tunnel: more specific than ours, so
+# they win. A hostile network can create them by claiming a public range as local
+# or by adding routes over DHCP, RA or ICMP redirects (TunnelVision, TunnelCrack).
+# Ignored: private and special ranges, neighbor (L) and cloned (W) entries, and
+# on-link IPv6 /64s, which every normal IPv6 network has.
+bypasses() {
+  netstat -rnf inet | awk '
+    function inside(a, net, len) { return plen >= len && int(a / 2^(32-len)) == int(net / 2^(32-len)) }
+    $1 !~ /^[0-9]/ || $4 ~ /^(utun|lo)/ || $3 ~ /[LW]/ {next}
+    {
+      n = split($1, p, "/"); k = split(p[1], o, ".")
+      plen = n > 1 ? p[2] : k * 8        # netstat omits the mask on whole octets
+      a = 0; for (i = 1; i <= 4; i++) a = a * 256 + (i <= k ? o[i] : 0)
+      if (inside(a, 10*2^24, 8) || inside(a, 127*2^24, 8) || inside(a, 100*2^24+64*2^16, 10) ||
+          inside(a, 169*2^24+254*2^16, 16) || inside(a, 172*2^24+16*2^16, 12) ||
+          inside(a, 192*2^24+168*2^16, 16) || inside(a, 192*2^24, 24) ||
+          inside(a, 198*2^24+18*2^16, 15) || a >= 224*2^24) next
+      printf "%s(%s) ", $1, $4
+    }'
+  netstat -rnf inet6 | awk '
+    $1 !~ /:/ || $1 ~ /^(fe[89ab]|ff|fc|fd)/ || $4 ~ /^(utun|lo)/ || $3 ~ /[LW]/ {next}
+    { n = split($1, p, "/"); plen = n > 1 ? p[2] : 128 }
+    $3 !~ /G/ && plen >= 64 {next}
+    { printf "%s(%s) ", $1, $4 }'
 }
 
 save_defaults() {
@@ -235,11 +261,13 @@ abort_on() {
 }
 
 on() {
-  local j i
+  local j i bypass
   j=$(ts_json) || die "Tailscale isn't responding; VPN not changed"
   [[ $(peer .Online <<<"$j") == true ]] || die "the exit node is offline or not in your tailnet; VPN not changed"
   [[ $(peer .ExitNodeOption <<<"$j") == true ]] || die "the exit node isn't approved: https://console.tailscale.com/admin/machines"
   [[ $(peer .ExitNode <<<"$j") == true ]] && already=1
+  bypass=$(bypasses)
+  [[ -z $bypass || -n $already ]] || die "this network routes public addresses around the VPN: ${bypass}- VPN not changed; don't trust this network"
   sudo -v || die "need sudo; VPN not changed"
   save_defaults || die "can't write to $STATE; VPN not changed"
   trap 'abort_on interrupted' INT TERM HUP
@@ -251,8 +279,9 @@ on() {
 }
 
 # Exit code: 0 protecting and the internet works, 3 off, 1 anything else.
+# With --local, don't contact the internet: 0 means only that this Mac is set up right.
 status() {
-  local j ip rc=1 left other
+  local j ip rc=1 left other bypass
   left=$(services_with ours)
   if ! j=$(ts_json) || [[ $(jq -r .BackendState <<<"$j") != Running ]]; then
     echo "VPN: NOT PROTECTING, Tailscale isn't running"
@@ -264,10 +293,12 @@ status() {
   elif [[ $(peer .Online <<<"$j") != true ]]; then echo "VPN: on, but the exit node is OFFLINE"
   elif ! routed; then echo "VPN: NOT PROTECTING, traffic is outside the tunnel (run: vpn on)"
   else
-    other=$(services_with other)
-    if [[ -n $other ]]; then echo "VPN: on, but DNS is outside the tunnel on: $other(run: vpn on)"
+    other=$(services_with other); bypass=$(bypasses)
+    if [[ -n $bypass ]]; then echo "VPN: on, but this network routes public addresses around it: ${bypass}(don't trust this network)"
+    elif [[ -n $other ]]; then echo "VPN: on, but DNS is outside the tunnel on: $other(run: vpn on)"
     else echo "VPN: on via $(peer .HostName <<<"$j")"; rc=0; fi
   fi
+  [[ ${1:-} == --local ]] && return $rc
   if ip=$(public_ip); then echo "Public IP: $ip"; else echo "Public IP: unreachable"; [[ $rc == 0 ]] && rc=1; fi
   return $rc
 }
@@ -283,6 +314,6 @@ check_setup() {
 case "${1:-status}" in
   on) check_setup; on ;;
   off) off || die "could not fully turn off"; echo "VPN: off" ;;
-  status) check_setup; status ;;
-  *) die "usage: vpn on|off|status" ;;
+  status) check_setup; status "${2:-}" ;;
+  *) die "usage: vpn on|off|status [--local]" ;;
 esac
